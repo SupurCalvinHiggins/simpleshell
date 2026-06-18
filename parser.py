@@ -14,6 +14,25 @@ class Trit(Enum):
         raise TypeError("`Trit` does not support implicit conversion to bool")
 
 
+# On keypress:
+# - Consume all contents of current buffer
+# - Check additional keypress is legal (custom error message?)
+# On enter:
+# - Consume all contents of current buffer
+# - Check enter is legal (custom error messages?)
+# Note: Should probably handle enter and keypress the same
+# On autosuggest:
+# - Consume all contents of current buffer
+# - Get all completions, if only one, suggest it
+# On input done:
+# - Consume all contents of current buffer
+# - Get contents of parsed command and execute it
+
+# What else might we like to do?
+# - Display the set of valid next characters
+# -
+
+
 class Parser(ABC):
     @abstractmethod
     def consume(self, c: str) -> None: ...
