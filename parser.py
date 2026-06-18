@@ -27,10 +27,21 @@ class Trit(Enum):
 # On input done:
 # - Consume all contents of current buffer
 # - Get contents of parsed command and execute it
+# On completion request:
+# - Consume all contents of current buffer
+# - Get all completions
 
 # What else might we like to do?
 # - Display the set of valid next characters
 # -
+
+# What questions are there:
+# - Is the set of all displayed completions the same as what we should allow to be typed?
+
+# What does this mean:
+# - get all completions
+# - get parsed version (tokens/arguments)
+# - check if a character is in the set of next characters in the completions (wrapper)
 
 
 class Parser(ABC):
