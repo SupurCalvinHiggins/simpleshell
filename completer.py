@@ -1,144 +1,154 @@
+from __future__ import annotations
+
+import functools
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-# On keypress:
-# - Consume all contents of current buffer
-# - Check additional keypress is legal (custom error message?)
-# On enter:
-# - Consume all contents of current buffer
-# - Check enter is legal (custom error messages?)
-# Note: Should probably handle enter and keypress the same
-# On autosuggest:
-# - Consume all contents of current buffer
-# - Get all completions, if only one, suggest it
-# On input done:
-# - Consume all contents of current buffer
-# - Get contents of parsed command and execute it
-# On completion request:
-# - Consume all contents of current buffer
-# - Get all completions
-
-# What else might we like to do?
-# - Display the set of valid next characters
-# -
-
-# What questions are there:
-# - Is the set of all displayed completions the same as what we should allow to be typed?
-
-# What does this mean:
-# - get all completions
-# - get parsed version (tokens/arguments)
+from path_state import PathState
+from spec import CommandSpec, LiteralSpec, PathSpec, ShellSpec
 
 
-@dataclass
-class Completion:
+@dataclass(frozen=True, slots=True)
+class CompletionResult:
     text: str
     display: str
 
 
-class Parser(ABC):
+class CompletionError: ...
+
+
+class Completer(ABC):
     @abstractmethod
-    def completions(self, token: str) -> list[Completion]:
-        # [] means invalid
-        # [""] means current is valid
-        # ["", "ack/"] means current is valid or can extend with "ack/"
-        ...
-
-    @abstractmethod
-    def parse(self, token: str) -> Any: ...
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError: ...
 
 
-@dataclass
-class LiteralParser(Parser):
-    literal: str
+@dataclass(frozen=True)
+class LiteralCompleter(Completer):
+    spec: LiteralSpec
 
-    def completions(self, token: str) -> list[Completion]:
-        completions = []
-        if self.literal.startswith(token):
-            completion = Completion(self.literal[len(token) :], self.literal)
-            completions.append(completion)
-        return completions
-
-    def parse(self, token: str) -> str | None:
-        return token if token == self.literal else None
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        if not self.spec.literal.startswith(text):
+            return CompletionError()
+        return [CompletionResult(self.spec.literal[len(text) :], self.spec.literal)]
 
 
-@dataclass
-class PathParser(Parser):
-    must_exist: bool | None = None
-    must_be_dir: bool | None = None
-    suffix: str | None = None
+@dataclass(frozen=True)
+class PathCompleter(Completer):
+    spec: PathSpec
 
-    def _candidates(self, token: str) -> list[Path]:
-        directory, suffix = os.path.split(token)
-
+    def _candidates(self, directory: str, suffix: str) -> list[Path]:
         # Candidates only exist if the path exists.
-        path = Path(directory) if directory else Path(".")
+        path = Path(directory or ".")
         if not path.is_dir():
             return []
 
-        candidates = sorted(path.iterdir())
+        # TODO: Add . as a candidate when reasonable.
+        candidates = list(path.iterdir())
+
         # .. is only a candidate if the path does not yet include a non-.. component.
         if not directory or directory.rstrip("/").endswith(".."):
-            candidates = [Path(".."), *candidates]
+            candidates.append(Path(".."))
 
-        # Candidates must extend the suffix.
-        return [path for path in candidates if path.name.startswith(suffix)]
+        # Candidates must extend the suffix
+        candidates = [path for path in candidates if path.name.startswith(suffix)]
 
-    def completions(self, token: str) -> list[Completion]:
-        directory, suffix = os.path.split(token)
+        # The current directory is a candidate if there is no suffix.
+        if directory and not suffix:
+            candidates.append(Path(""))
 
-        result = []
+        candidates.sort()
 
-        # Check if the current token is valid.
-        if token and self._is_valid(Path(token)):
-            result.append(Completion("", token))
+        return candidates
+
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        directory, suffix = os.path.split(text)
+
+        completions = []
 
         # Check if any candidate paths are valid.
-        for path in self._candidates(token):
-            if not self._is_valid(path):
+        for path in self._candidates(directory, suffix):
+            states = PathState.to_states(path)
+            if self.spec.state not in states:
                 continue
-            name = path.name + "/" if path.is_dir() else path.name
-            result.append(Completion(name[len(suffix) :], name))
+            name = path.name + "/" if path.is_dir() and path != Path("") else path.name
+            completions.append(CompletionResult(name[len(suffix) :], name))
+
+        if not completions:
+            return CompletionError()
+
+        return completions
+
+
+@dataclass(frozen=True)
+class CommandCompleter(Completer):
+    spec: CommandSpec
+
+    @functools.cached_property
+    def _completers(self) -> list[LiteralCompleter | PathCompleter]:
+        completers = []
+        for spec in self.spec.specs:
+            if isinstance(spec, LiteralSpec):
+                completers.append(LiteralCompleter(spec))
+            elif isinstance(spec, PathSpec):
+                completers.append(PathCompleter(spec))
+        return completers
+
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        parts = text.split(" ")
+        if not parts or len(parts) > len(self._completers):
+            return []
+
+        index = len(parts) - 1
+        for i in range(index):
+            part = parts[i]
+            completer = self._completers[i]
+            result = completer.complete(part)
+            if isinstance(result, CompletionError):
+                return result
+
+        part = parts[index]
+        completer = self._completers[index]
+        result = completer.complete(part)
+
+        if isinstance(result, CompletionError):
+            return result
+
+        completions = result
+
+        result = []
+        # TODO: do fusion of " " with non-empty completions
+        # i think this is possible when there is only one valid completion?
+        # no, even if there is only one valid completion for a path, there
+        # may be more left to the path; this might only be valid for literals
+        # might not be desirable: we would have both "ls" and "ls " as completions
+        for completion in completions:
+            # Extend complete arguments with a space.
+            if completion.text == "" and index < len(self._completers) - 1:
+                result.append(CompletionResult(" ", completion.display))
+            else:
+                result.append(completion)
+
+        if not result:
+            return CompletionError()
 
         return result
 
-    def _is_valid(self, path: Path) -> bool:
-        if self.must_exist is True and not path.exists():
-            return False
-        if self.must_exist is False and path.exists():
-            return False
-        # BUG: is_dir returns False if the path does not exist.
-        if self.must_be_dir is True and not path.is_dir():
-            return False
-???LINES MISSING
-            CommandParser([LiteralParser("mkdir"), OutputDirParser()]),
-            CommandParser([LiteralParser("rm"), InputFileParser()]),
-            CommandParser([LiteralParser("rmdir"), InputDirParser()]),
-            CommandParser([LiteralParser("cp"), InputFileParser(), OutputFileParser()]),
-            CommandParser(
-                [
-                    LiteralParser("cp"),
-                    LiteralParser("-r"),
-                    InputDirParser(),
-                    OutputDirParser(),
-                ]
-            ),
-            CommandParser(
-                [
-                    LiteralParser("python3"),
-                    PathParser(must_exist=True, must_be_dir=False, suffix=".py"),
-                ]
-            ),
-        ]
-    )
 
-    for buffer in ["l", "ls", "ls ", "ls .git/", "cp ", "cp pars"]:
-        print(f"buffer={buffer!r}")
-        completions = COMMANDS.completions(buffer)
-        for c in completions:
-            print(f"  {c}")
-        print()
+@dataclass(frozen=True)
+class ShellCompleter(Completer):
+    spec: ShellSpec
+
+    @functools.cached_property
+    def _completers(self) -> list[CommandCompleter]:
+        return [CommandCompleter(spec) for spec in self.spec.specs]
+
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        result = []
+        for completer in self._completers:
+            completions = completer.complete(text)
+            if isinstance(completions, CompletionError):
+                continue
+            result.extend(completions)
+        return result

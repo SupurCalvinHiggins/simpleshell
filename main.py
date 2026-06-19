@@ -24,10 +24,10 @@ from spec import (
     LiteralSpec,
     OutputPathSpec,
     ParseError,
-    ShellCompleter,
     ShellParser,
     ShellSpec,
 )
+from completer import ShellCompleter
 
 
 class PTShellCompleter(Completer):
