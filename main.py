@@ -15,6 +15,11 @@ from prompt_toolkit.filters import has_completions
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
+from completer import ShellCompleter
+from parser import (
+    ParseError,
+    ShellParser,
+)
 from spec import (
     CommandData,
     CommandSpec,
@@ -23,11 +28,8 @@ from spec import (
     InputPathSpec,
     LiteralSpec,
     OutputPathSpec,
-    ParseError,
-    ShellParser,
     ShellSpec,
 )
-from completer import ShellCompleter
 
 
 class PTShellCompleter(Completer):
