@@ -15,40 +15,35 @@ from prompt_toolkit.filters import has_completions
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from completer import ShellCompleter
-from parser import (
-    ParseError,
-    ShellParser,
-)
-from spec import (
-    CommandData,
-    CommandSpec,
-    InputDirSpec,
-    InputFileSpec,
-    InputPathSpec,
-    LiteralSpec,
-    OutputPathSpec,
-    ShellSpec,
-)
+from config import make_shell
+from engine import Completer as EngineCompleter
+from engine import CompletionError, ParseError
 
 
-class PTShellCompleter(Completer):
-    def __init__(self, completer: ShellCompleter) -> None:
+def is_err(x):
+    return isinstance(x, (CompletionError, ParseError))
+
+
+class CompleterAdapter(Completer):
+    def __init__(self, completer: EngineCompleter) -> None:
         self.completer = completer
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Iterable[Completion]:
         seen = set()
-        for completion in self.completer.complete(document.text):
+        completions_or_err = self.completer.complete(document.text)
+        if is_err(completions_or_err):
+            return
+        completions = completions_or_err
+        for completion in completions:
             if completion.text and completion not in seen:
                 seen.add(completion)
                 yield Completion(text=completion.text, display=completion.display)
 
 
-# NOTE: If ShellParser becomes a Parser, remove references to ShellParser.
-class PTShellAutoSuggest(AutoSuggest):
-    def __init__(self, completer: ShellCompleter) -> None:
+class AutoSuggestAdapter(AutoSuggest):
+    def __init__(self, completer: EngineCompleter) -> None:
         self.completer = completer
 
     def get_suggestion(self, buffer: Buffer, document: Document) -> Suggestion | None:
@@ -67,42 +62,9 @@ def toolbar():
     return validation_message
 
 
-def cd(args: CommandData):
-    _, dir = args
-    os.chdir(dir)
-
-
-def ls(args: CommandData):
-    dir = Path(".") if len(args) == 1 else args[1]
-    for path in dir.iterdir():
-        print(path.relative_to(dir).as_posix())
-
-
-spec = ShellSpec(
-    [
-        CommandSpec([LiteralSpec("cd"), InputDirSpec()], callback=cd),
-        CommandSpec([LiteralSpec("ls")], callback=ls),
-        CommandSpec([LiteralSpec("ls"), InputDirSpec()], callback=ls),
-        CommandSpec([LiteralSpec("pwd")]),
-        CommandSpec([LiteralSpec("cat"), InputFileSpec()]),
-        CommandSpec([LiteralSpec("touch"), OutputPathSpec()]),
-        CommandSpec([LiteralSpec("mkdir"), OutputPathSpec()]),
-        CommandSpec([LiteralSpec("rm"), InputFileSpec()]),
-        CommandSpec([LiteralSpec("rm"), LiteralSpec("-r"), InputDirSpec()]),
-        CommandSpec([LiteralSpec("rmdir"), InputDirSpec()]),
-        CommandSpec([LiteralSpec("mv"), InputPathSpec(), OutputPathSpec()]),
-        CommandSpec([LiteralSpec("cp"), InputFileSpec(), OutputPathSpec()]),
-        CommandSpec(
-            [LiteralSpec("cp"), LiteralSpec("-r"), InputDirSpec(), OutputPathSpec()]
-        ),
-        CommandSpec([LiteralSpec("python3"), InputFileSpec(suffix=".py")]),
-    ]
-)
-
-parser = ShellParser(spec)
-completer = ShellCompleter(spec)
-
 kb = KeyBindings()
+
+parser, completer = make_shell()
 
 
 @kb.add("enter", filter=~has_completions)
@@ -113,11 +75,12 @@ def _(event):
         event.app.current_buffer.validate_and_handle()
     else:
         global validation_message
+
         # TODO: Add error messages for:
         # - <ENTER> on no command
         # - Missing argument
         # - Invalid path
-        validation_message = "..."
+        validation_message = data.msg
 
 
 @kb.add("enter", filter=has_completions)
@@ -126,6 +89,11 @@ def _(event):
     current_completion = buf.complete_state.current_completion
     if current_completion is not None:
         buf.apply_completion(current_completion)
+    else:
+        # TODO: do the same as other <enter> event.
+        # this will fix the BUG where enter on valid doesnt work when there is
+        # a completion popup
+        pass
 
 
 @kb.add("<any>")
@@ -160,11 +128,11 @@ while True:
     text = session.prompt(
         message,
         style=style,
-        completer=PTShellCompleter(completer),
+        completer=CompleterAdapter(completer),
         complete_while_typing=False,
         key_bindings=kb,
         bottom_toolbar=toolbar,
-        auto_suggest=PTShellAutoSuggest(completer),
+        auto_suggest=AutoSuggestAdapter(completer),
         # enable_history_search=True,
         # rprompt=toolbar,
     )

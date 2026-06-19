@@ -6,8 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
-from path_state import PathState
-from spec import CommandSpec, LiteralSpec, PathSpec, ShellSpec
+from .path_state import PathState
+from .spec import CommandSpec, LiteralSpec, PathSpec, ShellSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,7 +16,9 @@ class CompletionResult:
     display: str
 
 
-class CompletionError: ...
+@dataclass(frozen=True, slots=True)
+class CompletionError:
+    msg: str = ""
 
 
 class Completer(ABC):
@@ -34,6 +36,7 @@ class LiteralCompleter(Completer):
         return [CompletionResult(self.spec.literal[len(text) :], self.spec.literal)]
 
 
+# BUG: Output path is completely broken.
 @dataclass(frozen=True)
 class PathCompleter(Completer):
     spec: PathSpec

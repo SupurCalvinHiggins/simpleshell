@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from path_state import PathState
+from .path_state import PathState
 
 # On x press with buffer == "c":
 # cx is not the start of a valid command. Press <TAB> to see all commands starting with c.
