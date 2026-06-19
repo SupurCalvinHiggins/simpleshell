@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import functools
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Self
@@ -43,10 +44,6 @@ class Parser[T](ABC):
     @abstractmethod
     def parse(self, text: str) -> ParseResult[T] | ParseError: ...
 
-    @abstractmethod
-    @classmethod
-    def from_spec(spec: Spec) -> Self: ...
-
 
 @dataclass
 class CompletionResult:
@@ -65,17 +62,6 @@ class Completer(ABC):
 class Executor(ABC):
     @abstractmethod
     def execute(self, cmd: CommandParseResult) -> None: ...
-
-
-class Spec[T](ABC):
-    @abstractmethod
-    def parser(self) -> Parser[T]: ...
-
-    @abstractmethod
-    def completer(self) -> Completer: ...
-
-
-ExecutableSpec = Spec[CommandData]
 
 
 @dataclass(frozen=True)
@@ -99,7 +85,7 @@ class LiteralCompleter(Completer):
 
 
 @dataclass(frozen=True)
-class LiteralSpec(Spec[str]):
+class LiteralSpec:
     literal: str
 
     def parser(self) -> Parser[str]:
@@ -192,15 +178,9 @@ class PathCompleter(Completer):
 
 
 @dataclass(frozen=True)
-class PathSpec(Spec[Path]):
+class PathSpec:
     state: PathState | None = None
     suffix: str | None = None
-
-    def parser(self) -> PathParser:
-        return PathParser(self)
-
-    def completer(self) -> PathCompleter:
-        return PathCompleter(self)
 
 
 class OutputPathSpec(PathSpec):
@@ -225,19 +205,86 @@ class InputFileSpec(PathSpec):
 
 @dataclass(frozen=True)
 class CommandParser(Parser[CommandData]):
-    def parse(self, text: str) -> CommandParseResult:
+    spec: CommandSpec
+
+    @functools.cached_property
+    def _parsers(self) -> list[LiteralParser | PathParser]:
+        parsers = []
+        for spec in self.spec.specs:
+            if isinstance(spec, LiteralSpec):
+                parsers.append(LiteralParser(spec))
+            elif isinstance(spec, PathSpec):
+                parsers.append(PathParser(spec))
+        return parsers
+
+    def parse(self, text: str) -> CommandParseResult | ParseError:
         parts = text.split(" ")
-        return [self.spec()]
+        if len(parts) != len(self._parsers):
+            return ParseError()
+        data = [parser.parse(part) for part, parser in zip(parts, self._parsers)]
+        return CommandParseResult(data, self.spec.callback)
 
-        raise NotImplementedError
+
+# TODO: spec_to_parser, spec_to_completer
 
 
 @dataclass(frozen=True)
-class CommandCompleter(Completer): ...
+class CommandCompleter(Completer):
+    spec: CommandSpec
+
+    @functools.cached_property
+    def _completers(self) -> list[LiteralCompleter | PathCompleter]:
+        completers = []
+        for spec in self.spec.specs:
+            if isinstance(spec, LiteralSpec):
+                completers.append(LiteralCompleter(spec))
+            elif isinstance(spec, PathSpec):
+                completers.append(PathCompleter(spec))
+        return completers
+
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        parts = text.split(" ")
+        if not parts or len(parts) > len(self._completers):
+            return []
+
+        index = len(parts) - 1
+        for i in range(index):
+            part = parts[i]
+            completer = self._completers[i]
+            result = completer.complete(part)
+            if isinstance(result, CompletionError):
+                return result
+
+        part = parts[index]
+        completer = self._completers[index]
+        result = completer.complete(part)
+
+        if isinstance(result, CompletionError):
+            return result
+
+        completions = result
+
+        result = []
+        # TODO: do fusion of " " with non-empty completions
+        # i think this is possible when there is only one valid completion?
+        # no, even if there is only one valid completion for a path, there
+        # may be more left to the path; this might only be valid for literals
+        # might not be desirable: we would have both "ls" and "ls " as completions
+        for completion in completions:
+            # Extend complete arguments with a space.
+            if completion.text == "" and index < len(self._completers) - 1:
+                result.append(CompletionResult(" ", completion.display))
+            else:
+                result.append(completion)
+
+        if not result:
+            return CompletionError()
+
+        return result
 
 
 @dataclass(frozen=True)
-class CommandSpec(ExecutableSpec):
+class CommandSpec:
     specs: list[LiteralSpec | PathSpec]
 
     @staticmethod
@@ -246,42 +293,50 @@ class CommandSpec(ExecutableSpec):
 
     callback: CommandCallback = _default_callback
 
-    def parser(self) -> CommandParser:
-        # TODO:
-        raise NotImplementedError
-
-    def completer(self) -> CommandCompleter:
-        # TODO:
-        raise NotImplementedError
-
 
 @dataclass(frozen=True)
 class ShellParser(CommandParser):
-    def parse(self, text: str) -> CommandParseResult:
-        raise NotImplementedError
+    spec: ShellSpec
+
+    @functools.cached_property
+    def _parsers(self) -> list[CommandParser]:
+        return [CommandParser(spec) for spec in self.spec.specs]
+
+    def parse(self, text: str) -> CommandParseResult | ParseError:
+        for parser in self._parsers:
+            result = parser.parse(text)
+            if isinstance(result, CommandParseResult):
+                return result
+        return ParseError()
 
 
 @dataclass(frozen=True)
-class ShellCompleter(Completer): ...
+class ShellCompleter(Completer):
+    spec: ShellSpec
+
+    @functools.cached_property
+    def _completers(self) -> list[CommandCompleter]:
+        return [CommandCompleter(spec) for spec in self.spec.specs]
+
+    def complete(self, text: str) -> list[CompletionResult] | CompletionError:
+        result = []
+        for completer in self._completers:
+            completions = completer.complete(text)
+            if isinstance(completions, CompletionError):
+                continue
+            result.extend(completions)
+        return result
 
 
 @dataclass(frozen=True)
-class ShellSpec(ExecutableSpec):
+class ShellSpec:
     specs: list[CommandSpec]
-
-    def parser(self) -> ShellParser:
-        # TODO:
-        raise NotImplementedError
-
-    def completer(self) -> ShellCompleter:
-        # TODO:
-        raise NotImplementedError
 
 
 if __name__ == "__main__":
     for text in ["", ".", "..", "../"]:
         print(text)
-        print(PathCompleter(PathState.EXISTS).complete(text))
+        print(PathCompleter(InputPathSpec()).complete(text))
 
     spec = ShellSpec(
         [
@@ -303,6 +358,7 @@ if __name__ == "__main__":
             CommandSpec([LiteralSpec("python3"), InputFileSpec(suffix=".py")]),
         ]
     )
+
 
 # Architecture:
 # Define available commands with a Spec
