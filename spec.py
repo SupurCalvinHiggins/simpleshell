@@ -23,7 +23,7 @@ from typing import Callable, Self
 # TDLR; some errors will come from parser, others from completer
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ParseResult[T]:
     data: T
 
@@ -32,7 +32,7 @@ CommandData = list[str | Path]
 CommandCallback = Callable[[CommandData], None]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CommandParseResult(ParseResult[CommandData]):
     callback: CommandCallback
 
@@ -45,7 +45,7 @@ class Parser[T](ABC):
     def parse(self, text: str) -> ParseResult[T] | ParseError: ...
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CompletionResult:
     text: str
     display: str
@@ -69,7 +69,7 @@ class LiteralParser(Parser[str]):
     spec: LiteralSpec
 
     def parse(self, text: str) -> ParseResult[str] | ParseError:
-        if text != self.literal:
+        if text != self.spec.literal:
             return ParseError()
         return ParseResult(text)
 
@@ -221,7 +221,12 @@ class CommandParser(Parser[CommandData]):
         parts = text.split(" ")
         if len(parts) != len(self._parsers):
             return ParseError()
-        data = [parser.parse(part) for part, parser in zip(parts, self._parsers)]
+        data = []
+        for part, parser in zip(parts, self._parsers):
+            result = parser.parse(part)
+            if isinstance(result, ParseError):
+                return result
+            data.append(result.data)
         return CommandParseResult(data, self.spec.callback)
 
 
@@ -289,7 +294,8 @@ class CommandSpec:
 
     @staticmethod
     def _default_callback(args: CommandData) -> None:
-        raise NotImplementedError
+        return None
+        # raise NotImplementedError
 
     callback: CommandCallback = _default_callback
 
