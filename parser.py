@@ -1,18 +1,8 @@
+import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from enum import Enum, auto
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
-
-
-class Trit(Enum):
-    YES = auto()
-    NO = auto()
-    MAYBE = auto()
-
-    def __bool__(self) -> bool:
-        raise TypeError("`Trit` does not support implicit conversion to bool")
-
+from typing import Any, Callable
 
 # On keypress:
 # - Consume all contents of current buffer
@@ -41,230 +31,298 @@ class Trit(Enum):
 # What does this mean:
 # - get all completions
 # - get parsed version (tokens/arguments)
-# - check if a character is in the set of next characters in the completions (wrapper)
+
+
+@dataclass
+class Completion:
+    text: str
+    display: str
 
 
 class Parser(ABC):
     @abstractmethod
-    def consume(self, c: str) -> None: ...
+    def completions(self, token: str) -> list[Completion]:
+        # [] means invalid
+        # [""] means current is valid
+        # ["", "ack/"] means current is valid or can extend with "ack/"
+        ...
 
-    @property
     @abstractmethod
-    def lookahead(self) -> set[str]: ...
-
-    @property
-    @abstractmethod
-    def status(self) -> Trit: ...
+    def parse(self, token: str) -> Any: ...
 
 
 @dataclass
 class LiteralParser(Parser):
     literal: str
 
-    _i: int = 0
-    _status: Trit = Trit.MAYBE
+    def completions(self, token: str) -> list[Completion]:
+        completions = []
+        if self.literal.startswith(token):
+            completion = Completion(self.literal[len(token) :], self.literal)
+            completions.append(completion)
+        return completions
 
-    def consume(self, c: str) -> None:
-        if self._status != Trit.MAYBE:
-            self._status = Trit.NO
-            return
-
-        if self.literal[self._i] != c:
-            self._status = Trit.NO
-            return
-
-        self._i += 1
-        if self._i == len(self.literal):
-            self._status = Trit.YES
-
-    @property
-    def lookahead(self) -> set[str]:
-        chars = set()
-
-        if self._status != Trit.MAYBE:
-            return chars
-
-        chars.add(self.literal[self._i])
-        return chars
-
-    @property
-    def status(self) -> Trit:
-        return self._status
+    def parse(self, token: str) -> str | None:
+        return token if token == self.literal else None
 
 
 @dataclass
 class PathParser(Parser):
-    exists: Trit = Trit.MAYBE
-    is_dir: Trit = Trit.MAYBE
+    must_exist: bool | None = None
+    must_be_dir: bool | None = None
     suffix: str | None = None
 
-    _directory: str = ""
-    _prefix: str = ""
-    _status: Trit = Trit.MAYBE
+    def _candidates(self, token: str) -> list[Path]:
+        directory, suffix = os.path.split(token)
 
-    def consume(self, c: str) -> None:
-        assert self.exists == Trit.YES
+        # Candidates only exist if the path exists.
+        path = Path(directory) if directory else Path(".")
+        if not path.is_dir():
+            return []
 
-        if self._status == Trit.NO:
-            return
+        candidates = sorted(path.iterdir())
+        # .. is only a candidate if the path does not yet include a non-.. component.
+        if not directory or directory.rstrip("/").endswith(".."):
+            candidates = [Path(".."), *candidates]
 
-        if c not in self.lookahead:
-            self._status = Trit.NO
-            return
+        # Candidates must extend the suffix.
+        return [path for path in candidates if path.name.startswith(suffix)]
 
-        if c != "/":
-            self._prefix += c
-        else:
-            self._directory += self._prefix + c
-            self._prefix = ""
+    def completions(self, token: str) -> list[Completion]:
+        directory, suffix = os.path.split(token)
 
-        if Path(self._directory + self._prefix).exists():
-            self._status = Trit.YES
-        else:
-            self._status = Trit.MAYBE if self.lookahead else Trit.NO
+        result = []
 
-    @property
-    def completions(self) -> Iterator[str]:
-        assert self.exists == Trit.YES
+        # Check if the current token is valid.
+        if token and self._is_valid(Path(token)):
+            result.append(Completion("", token))
 
-        # Only allow a sequence of zero or more .. at the start of the path.
-        candidates = list(Path(self._directory).iterdir())
-        if not self._directory or self._directory.endswith(".."):
-            candidates.append(Path(".."))
-        candidates.sort()
-
-        for path in candidates:
-            is_dir = path.is_dir()
-            if (
-                self.is_dir == Trit.YES
-                and not is_dir
-                or self.is_dir == Trit.NO
-                and is_dir
-            ):
+        # Check if any candidate paths are valid.
+        for path in self._candidates(token):
+            if not self._is_valid(path):
                 continue
+            name = path.name + "/" if path.is_dir() else path.name
+            result.append(Completion(name[len(suffix) :], name))
 
-            name = path.name + "/" if is_dir else path.name
-            if not name.startswith(self._prefix):
-                continue
+        return result
 
-            completion = name[len(self._prefix) :]
-            yield completion
+    def _is_valid(self, path: Path) -> bool:
+        if self.must_exist is True and not path.exists():
+            return False
+        if self.must_exist is False and path.exists():
+            return False
+        # BUG: is_dir returns False if the path does not exist.
+        if self.must_be_dir is True and not path.is_dir():
+            return False
+        if self.must_be_dir is False and path.is_dir():
+            return False
+        if self.suffix and path.suffix != self.suffix:
+            return False
+        return True
 
-    @property
-    def lookahead(self) -> set[str]:
-        res = set(c[0] for c in self.completions if c)
-        return res
-
-    @property
-    def status(self) -> Trit:
-        return self._status
+    def parse(self, token: str) -> Path | None:
+        path = Path(token)
+        if not self._is_valid(path):
+            return None
+        return path
 
 
 class InputDirParser(PathParser):
     def __init__(self) -> None:
-        super().__init__(exists=Trit.YES, is_dir=Trit.YES)
+        super().__init__(must_exist=True, must_be_dir=True)
 
 
 class InputFileParser(PathParser):
     def __init__(self) -> None:
-        super().__init__(exists=Trit.YES, is_dir=Trit.NO)
+        super().__init__(must_exist=True, must_be_dir=False)
 
 
 class OutputDirParser(PathParser):
     def __init__(self) -> None:
-        super().__init__(exists=Trit.NO, is_dir=Trit.YES)
+        super().__init__(must_exist=False, must_be_dir=True)
 
 
 class OutputFileParser(PathParser):
     def __init__(self) -> None:
-        super().__init__(exists=Trit.NO, is_dir=Trit.NO)
+        super().__init__(must_exist=False, must_be_dir=False)
 
 
-# required vs. optional
-# specific path kinds (exists / dne, filetype, directory)
-# command name
-
-# cd, ls, touch, mkdir, rm, rmdir, mv, cat, python3, g++, pwd
-
-
-"""
-COMMANDS = [
-    [LiteralParser("cd"), InputDirParser()],
-    [LiteralParser("ls")],
-    [LiteralParser("ls"), InputDirParser()],
-    [LiteralParser("pwd")],
-    [LiteralParser("cat"), InputFileParser()],
-    [LiteralParser("touch"), OutputFileParser()],
-    [LiteralParser("mkdir"), OutputDirParser()],
-    [LiteralParser("rm"), InputFileParser()],
-    [LiteralParser("rmdir"), InputDirParser()],
-    [LiteralParser("mv"), PathParser(exists=True), PathParser(exists=False)],
-    [LiteralParser("cp"), InputFileParser(), OutputFileParser()],
-    [LiteralParser("cp"), LiteralParser("-r"), InputDirParser(), OutputDirParser()],
-    [LiteralParser("python3"), PathParser(exists=True, is_dir=False, suffix=".py")],
-]
-          """
-
-
-# Idea:
-# Incrementally match input against set of commands. Maintain the commands with valid
-# continuations. If a character is not a valid continuation of any command, reject it.
-# Should the arguments be responsible for matching themselves? probably. what should that
-# interface look like? well, it will take a single character and consume it. the caller
-# is responsible for ensuring that the character is valid to pass
-# need set of valid next characters to check this
 @dataclass
-class CommandParser(Parser):
+class CdCommand:
+    path: Path
+
+
+@dataclass
+class LsCommand:
+    path: Path = field(default_factory=lambda: Path("."))
+
+
+@dataclass
+class PwdCommand: ...
+
+
+@dataclass
+class CatCommand:
+    path: Path
+
+
+@dataclass
+class TouchCommand:
+    path: Path
+
+
+@dataclass
+class MkdirCommand:
+    path: Path
+
+
+@dataclass
+class RmCommand:
+    path: Path
+
+
+@dataclass
+class RmdirCommand:
+    path: Path
+
+
+@dataclass
+class CpCommand:
+    source_path: Path
+    destination_path: Path
+
+
+@dataclass
+class CpRCommand:
+    source_path: Path
+    destination_path: Path
+
+
+@dataclass
+class PythonCommand:
+    path: Path
+
+
+Command = (
+    CdCommand
+    | LsCommand
+    | PwdCommand
+    | CatCommand
+    | TouchCommand
+    | MkdirCommand
+    | RmdirCommand
+    | CpCommand
+    | CpRCommand
+    | PythonCommand
+)
+
+
+@dataclass
+class CommandParser:
     args: list[Parser]
+    result: Callable[..., Command]
 
-    _i: int = 0
-    _status: Trit = Trit.MAYBE
+    def completions(self, tokens: list[str]) -> list[Completion]:
+        if not tokens or len(tokens) > len(self.args):
+            return []
 
-    def consume(self, c: str) -> None:
-        if self._status == Trit.NO:
-            return
+        index = len(tokens) - 1
+        for i in range(index):
+            if not self.args[i].completions(tokens[i]):
+                return []
 
-        if c not in self.lookahead:
-            self._status = Trit.NO
-            return
+        token = tokens[index]
+        arg = self.args[index]
+        completions = arg.completions(token)
 
-        if c == " ":
-            self._i += 1
-        else:
-            self.args[self._i].consume(c)
+        if not completions:
+            # TODO: Compute error message here.
+            return []
 
-        arg = self.args[self._i]
-        if self._i == len(self.args) - 1:
-            self._status = arg.status
+        result = []
+        # TODO: do fusion of " " with non-empty completions
+        # i think this is possible when there is only one valid completion?
+        # no, even if there is only one valid completion for a path, there
+        # may be more left to the path; this might only be valid for literals
+        # might not be desirable: we would have both "ls" and "ls " as completions
+        for completion in completions:
+            # Extend complete arguments with a space.
+            if completion.text == "" and index < len(self.args) - 1:
+                result.append(Completion(" ", completion.display))
+            else:
+                result.append(completion)
 
-    @property
-    def lookahead(self) -> set[str]:
-        chars = set()
+        return result
 
-        if self._status == Trit.NO:
-            return chars
-
-        # if the current arg is good, space is valid (or \n for last arg)
-        arg = self.args[self._i]
-        if arg.status == Trit.YES and self._i < len(self.args) - 1:
-            chars.add(" ")
-
-        chars |= arg.lookahead
-        return chars
-
-    @property
-    def status(self) -> Trit:
-        return self._status
+    def parse(self, tokens: list[str]) -> Command | None:
+        if len(tokens) != len(self.args):
+            return None
+        parsed = []
+        for arg, token in zip(self.args, tokens):
+            value = arg.parse(token)
+            if value is None:
+                return None
+            if isinstance(arg, LiteralParser):
+                continue
+            parsed.append(value)
+        return self.result(*parsed)
 
 
-if __name__ == "__main__":
-    # parser = CommandParser([LiteralParser("ls"), LiteralParser("-la")])
-    parser = CommandParser([LiteralParser("ls"), InputDirParser()])
-    # for c in "ls -la h":
-    for c in "ls .git/z":
-        print(parser.status)
-        print(parser.lookahead)
-        parser.consume(c)
-        print(parser.status)
-        print(parser.lookahead)
-        print()
+@dataclass
+class ShellParser:
+    commands: list[CommandParser]
+
+    def completions(self, buffer: str) -> list[Completion]:
+        tokens = buffer.split(" ")
+        result = []
+        seen = set()
+        for cmd in self.commands:
+            for c in cmd.completions(tokens):
+                key = (c.text, c.display)
+                if key not in seen:
+                    seen.add(key)
+                    result.append(c)
+        return result
+
+    def parse(self, buffer: str) -> list[Any] | None:
+        tokens = buffer.split(" ")
+        for cmd in self.commands:
+            result = cmd.parse(tokens)
+            if result is not None:
+                return result
+        return None
+
+
+def make_parser() -> ShellParser:
+    return ShellParser(
+        [
+            CommandParser([LiteralParser("cd"), InputDirParser()], CdCommand),
+            CommandParser([LiteralParser("ls")], LsCommand),
+            CommandParser([LiteralParser("ls"), InputDirParser()], LsCommand),
+            CommandParser([LiteralParser("pwd")], PwdCommand),
+            CommandParser([LiteralParser("cat"), InputFileParser()], CatCommand),
+            CommandParser([LiteralParser("touch"), OutputFileParser()], TouchCommand),
+            CommandParser([LiteralParser("mkdir"), OutputDirParser()], MkdirCommand),
+            CommandParser([LiteralParser("rm"), InputFileParser()], RmCommand),
+            CommandParser([LiteralParser("rmdir"), InputDirParser()], RmdirCommand),
+            CommandParser(
+                [LiteralParser("cp"), InputFileParser(), OutputFileParser()], CpCommand
+            ),
+            CommandParser(
+                [
+                    LiteralParser("cp"),
+                    LiteralParser("-r"),
+                    InputDirParser(),
+                    OutputDirParser(),
+                ],
+                CpRCommand,
+            ),
+            CommandParser(
+                [
+                    LiteralParser("python3"),
+                    PathParser(must_exist=True, must_be_dir=False, suffix=".py"),
+                ],
+                PythonCommand,
+            ),
+        ]
+    )
